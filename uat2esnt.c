@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <getopt.h>
 
 #include "uat.h"
 #include "uat_decode.h"
@@ -222,6 +223,23 @@ static int encode_cpr_lon(double lat, double lon, int odd, int surface)
     return XZ & 0x1FFFF; // always a 17-bit field
 }
 
+static int encode_cf(struct uat_adsb_mdb *mdb)
+{
+    // Encode the CF field for DF 18; this says whether this
+    // is a TIS-B message, an ADS-B rebroadcast, etc
+    switch (mdb->address_qualifier) {
+    case AQ_ADSB_ICAO:
+        return 6; // ADS-B rebroadcast, will use IMF=0
+    case AQ_TISB_ICAO:
+        return 2; // Fine TIS-B message, will use IMF=0
+    case AQ_TISB_OTHER:
+        return 2; // Fine TIS-B message, will use IMF=1
+    default:
+        // national, fixed beacon, vehicle, reserved
+        return 1; // ES/NT devices that use other addressing techniques
+    }
+}
+
 static int encode_imf(struct uat_adsb_mdb *mdb)
 {
     // Encode the IMF bit for DF 18; this is 0 if the address
@@ -252,7 +270,7 @@ static void send_altitude_only(struct uat_adsb_mdb *mdb)
     }
 
     setbits(esnt_frame, 1, 5, 18);                 // DF=18, ES/NT
-    setbits(esnt_frame, 6, 8, 6);                  // CF=6,  ADS-R
+    setbits(esnt_frame, 6, 8, encode_cf(mdb));     // CF
     setbits(esnt_frame, 9, 32, mdb->address);      // AA
 
     // ES:
@@ -276,7 +294,7 @@ static void maybe_send_surface_position(struct uat_adsb_mdb *mdb)
         return; // nope!
 
     setbits(esnt_frame, 1, 5, 18);                 // DF=18, ES/NT
-    setbits(esnt_frame, 6, 8, 6);                  // CF=6,  ADS-R
+    setbits(esnt_frame, 6, 8, encode_cf(mdb));     // CF
     setbits(esnt_frame, 9, 32, mdb->address);      // AA
 
     setbits(esnt_frame+4, 1, 5, 8);                                            // FORMAT TYPE CODE = 8, surface position (NUCp=6)
@@ -324,7 +342,7 @@ static void maybe_send_air_position(struct uat_adsb_mdb *mdb)
     }        
 
     setbits(esnt_frame, 1, 5, 18);            // DF=18, ES/NT
-    setbits(esnt_frame, 6, 8, 6);             // CF=6,  ADS-R
+    setbits(esnt_frame, 6, 8, encode_cf(mdb));// CF
     setbits(esnt_frame, 9, 32, mdb->address); // AA
 
     // decide on a metype
@@ -377,7 +395,7 @@ static void maybe_send_air_velocity(struct uat_adsb_mdb *mdb)
     }
 
     setbits(esnt_frame, 1, 5, 18);            // DF=18, ES/NT
-    setbits(esnt_frame, 6, 8, 6);             // CF=6,  ADS-R
+    setbits(esnt_frame, 6, 8, encode_cf(mdb));// CF
     setbits(esnt_frame, 9, 32, mdb->address); // AA
 
     supersonic = (mdb->airground_state == AG_SUPERSONIC);
@@ -484,18 +502,31 @@ static unsigned encodeSquawk(char *squawkStr)
     return encoded;
 }
 
+static int mapSquawkToEmergency(const char *squawkStr)
+{
+    if (!strcmp(squawkStr, "7500"))
+        return 5; // Unlawful Interference
+    if (!strcmp(squawkStr, "7600"))
+        return 4; // No Communications
+    if (!strcmp(squawkStr, "7700"))
+        return 1; // General Emergency
+    return 0; // No Emergency
+}
+
 static void maybe_send_callsign(struct uat_adsb_mdb *mdb)
 {
     uint8_t esnt_frame[14];
     int imf = encode_imf(mdb);
 
-    // NB: we choose a CF value based on the address type (IMF value);
-    // we shouldn't send CF=6 with no IMF bit for non-ICAO addresses
-    // (see doc 9871 B.3.4.3)
     switch (mdb->callsign_type) {
     case CS_CALLSIGN:
+        if (imf) {
+            // Not sent with non-ICAO addresses
+            return;
+        }
+
         setbits(esnt_frame, 1, 5, 18);            // DF=18, ES/NT
-        setbits(esnt_frame, 6, 8, imf ? 5 : 6);   // CF=6 for ICAO, CF=5 for non-ICAO
+        setbits(esnt_frame, 6, 8, encode_cf(mdb));// CF
         setbits(esnt_frame, 9, 32, mdb->address); // AA
 
         if (mdb->emitter_category <= 7) {
@@ -529,28 +560,17 @@ static void maybe_send_callsign(struct uat_adsb_mdb *mdb)
         break;
 
     case CS_SQUAWK:
-        if (imf) {
-            // Non-ICAO address, send as DF18 "test message"
-            setbits(esnt_frame, 1, 5, 18);            // DF=18, ES/NT
-            setbits(esnt_frame, 6, 8, 5);             // CF=5, TIS-B retransmission with non-ICAO address
-            setbits(esnt_frame, 9, 32, mdb->address); // AA
+        setbits(esnt_frame, 1, 5, 18);            // DF=18, ES/NT
+        setbits(esnt_frame, 6, 8, encode_cf(mdb));// CF
+        setbits(esnt_frame, 9, 32, mdb->address); // AA
 
-            setbits(esnt_frame+4, 1, 5, 23);                           // FORMAT TYPE CODE = 23, test message
-            setbits(esnt_frame+4, 6, 8, 7);                            // subtype = 7, squawk
-            setbits(esnt_frame+4, 9, 21, encodeSquawk(mdb->callsign));
-
-            checksum_and_send(esnt_frame, 14, 0);
-        } else {
-            // ICAO address, send as DF5
-            setbits(esnt_frame, 1, 5, 5);            // DF=5, Surveillance Identity Reply
-            setbits(esnt_frame, 6, 8, 0);            // Flight Status
-            setbits(esnt_frame, 9, 13, 0);           // Downlink Request
-            setbits(esnt_frame, 14, 19, 0);          // Utility Message
-            setbits(esnt_frame, 20, 32, encodeSquawk(mdb->callsign)); // Identity
-
-            checksum_and_send(esnt_frame, 7, mdb->address); // put address in checksum (Address/Parity)
-        }
-
+        setbits(esnt_frame+4, 1, 5, 28);                           // FORMAT TYPE CODE = 28, Aircraft Status Message
+        setbits(esnt_frame+4, 6, 8, 1);                            // subtype = 1, emergency/priority status
+        setbits(esnt_frame+4, 9, 11, mapSquawkToEmergency(mdb->callsign));
+        setbits(esnt_frame+4, 12, 24, encodeSquawk(mdb->callsign));
+        // 25..55 reserved
+        setbits(esnt_frame+4, 56, 56, imf);
+        checksum_and_send(esnt_frame, 14, 0);
         break;
 
     default:
@@ -620,19 +640,72 @@ static void generate_esnt(struct uat_adsb_mdb *mdb)
 
 }
 
+static int use_tisb = 1;
+
+static int should_send(struct uat_adsb_mdb *mdb)
+{
+    switch (mdb->address_qualifier) {
+    case AQ_ADSB_ICAO:
+        return 1; // Real UAT
+    case AQ_TISB_ICAO:
+    case AQ_TISB_OTHER:
+        return use_tisb; // Only if TIS-B is enabled
+    default:
+        return 1;
+    }
+}
+
 static void handle_frame(frame_type_t type, uint8_t *frame, int len, void *extra)
 {
     if (type == UAT_DOWNLINK) {
         struct uat_adsb_mdb mdb;
         uat_decode_adsb_mdb(frame, &mdb);
-        generate_esnt(&mdb);
+
+        if (should_send(&mdb)) {
+            generate_esnt(&mdb);
+        }
     }
 }        
+
+void usage(int argc, char **argv)
+{
+    fprintf(stderr,
+            "usage: %s [-t]\n"
+            "\n"
+            "Reads UAT downlink messages from stdin and writes ADS-B ES/NT messages\n"
+            "(1090MHz-style) to stdout.\n"
+            "\n"
+            "  -t   Disable forwarding of TIS-B traffic\n"
+            "  -h   Show this usage message\n",
+            argv[0]);
+}
 
 int main(int argc, char **argv)
 {
     struct dump978_reader *reader;
     int framecount;
+    int opt;
+
+    while ((opt = getopt(argc, argv, "ht")) > 0) {
+        switch (opt) {
+        case 'h':
+            usage(argc, argv);
+            return 0;
+
+        case 't':
+            use_tisb = 0;
+            break;
+
+        default:
+            usage(argc, argv);
+            return 1;
+        }
+    }
+
+    if (optind < argc) {
+        usage(argc, argv);
+        return 1;
+    }
 
     initCrcTables();
 
